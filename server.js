@@ -1,7 +1,6 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { Mp3Encoder } from "@breezystack/lamejs";
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
@@ -14,10 +13,9 @@ import { z } from "zod";
 const MODEL_ID = "onnx-community/Kokoro-82M-v1.0-ONNX";
 const DTYPE = process.env.KOKORO_DTYPE || "q8";
 const IS_CLOUD_RUN = Boolean(process.env.K_SERVICE);
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const OUTPUT_DIR =
-  process.env.OUTPUT_DIR ||
-  (IS_CLOUD_RUN ? path.join(os.tmpdir(), "kokoro-tts-output") : path.join(__dirname, "output"));
+const AUDIO_TTL_MS = Number(process.env.AUDIO_TTL_MS ?? 10 * 60 * 1000);
+const MAX_STORED_CLIPS = Number(process.env.MAX_STORED_CLIPS ?? 100);
+const audioStore = new Map();
 
 if (process.env.HF_CACHE_DIR || IS_CLOUD_RUN) {
   try {
@@ -84,47 +82,93 @@ function encodeMp3(rawAudio, kbps = 128) {
   return Buffer.concat(chunks);
 }
 
-function resolveOutputPath(outputPath, voice, format) {
+function sanitizeFilename(outputPath, voice, format) {
   const ext = `.${format}`;
   if (!outputPath) {
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    return path.join(OUTPUT_DIR, `speech-${voice}-${timestamp}${ext}`);
+    return `speech-${voice}-${timestamp}${ext}`;
   }
-  const hasDir = path.isAbsolute(outputPath) || outputPath.includes("/") || outputPath.includes("\\");
-  let target = hasDir ? outputPath : path.join(OUTPUT_DIR, outputPath);
-  if (!path.extname(target)) {
-    target += ext;
+  const base = path.basename(outputPath).replace(/["\r\n]/g, "").trim();
+  const clean = base || `speech-${voice}`;
+  const currentExt = path.extname(clean);
+  if (!currentExt) return `${clean}${ext}`;
+  if (currentExt.toLowerCase() !== ext) {
+    return `${clean.slice(0, -currentExt.length)}${ext}`;
   }
-  return target;
+  return clean;
 }
 
-async function synthesizeAudio({ text, voice = "af_heart", speed = 1.0, format = "mp3", outputPath }) {
+function storeAudioClip({ buffer, mimeType, filename, format }) {
+  if (MAX_STORED_CLIPS > 0 && audioStore.size >= MAX_STORED_CLIPS) {
+    const oldestKey = audioStore.keys().next().value;
+    if (oldestKey !== undefined) {
+      const oldest = audioStore.get(oldestKey);
+      if (oldest?.timeout) clearTimeout(oldest.timeout);
+      audioStore.delete(oldestKey);
+    }
+  }
+
+  const id = crypto.randomUUID();
+  const expiresAt = Date.now() + AUDIO_TTL_MS;
+  const timeout = setTimeout(() => {
+    audioStore.delete(id);
+  }, AUDIO_TTL_MS);
+  timeout.unref?.();
+
+  audioStore.set(id, {
+    buffer,
+    mimeType,
+    filename,
+    format,
+    createdAt: Date.now(),
+    expiresAt,
+    timeout,
+  });
+
+  return { id, expiresAt };
+}
+
+function getBaseUrl(c) {
+  const configured = process.env.PUBLIC_URL || process.env.BASE_URL;
+  if (configured) {
+    return configured.replace(/\/+$/, "");
+  }
+  const forwardedHost = c.req.header("x-forwarded-host") || c.req.header("host");
+  const forwardedProto =
+    c.req.header("x-forwarded-proto") ||
+    (IS_CLOUD_RUN ? "https" : new URL(c.req.url).protocol.replace(":", ""));
+  if (forwardedHost) {
+    const proto = forwardedProto.split(",")[0].trim();
+    const host = forwardedHost.split(",")[0].trim();
+    return `${proto}://${host}`;
+  }
+  return new URL(c.req.url).origin;
+}
+
+async function synthesizeAudio({ text, voice = "af_heart", speed = 1.0, format = "mp3", outputPath, baseUrl }) {
   const tts = await getTTS();
   const audio = await tts.generate(text, { voice, speed });
 
-  const isWav =
-    format === "wav" || (outputPath && outputPath.toLowerCase().endsWith(".wav") && format !== "mp3");
+  const isWav = format === "wav";
   const finalFormat = isWav ? "wav" : "mp3";
   const mimeType = finalFormat === "wav" ? "audio/wav" : "audio/mpeg";
   const audioBuffer = finalFormat === "wav" ? Buffer.from(audio.toWav()) : encodeMp3(audio);
+  const filename = sanitizeFilename(outputPath, voice, finalFormat);
 
-  const finalPath = resolveOutputPath(outputPath, voice, finalFormat);
-  let savedPath = null;
-  try {
-    await mkdir(path.dirname(finalPath), { recursive: true });
-    await writeFile(finalPath, audioBuffer);
-    savedPath = finalPath;
-  } catch (err) {
-    if (outputPath) {
-      throw err;
-    }
-    console.warn("Skipping disk write for generated audio:", err.message);
-  }
+  const { id, expiresAt } = storeAudioClip({
+    buffer: audioBuffer,
+    mimeType,
+    filename,
+    format: finalFormat,
+  });
 
-  return { audioBuffer, finalFormat, mimeType, savedPath, finalPath };
+  const downloadPath = `/download/${id}`;
+  const downloadUrl = baseUrl ? `${baseUrl}${downloadPath}` : downloadPath;
+
+  return { audioBuffer, finalFormat, mimeType, filename, id, expiresAt, downloadPath, downloadUrl };
 }
 
-function createMcpServer() {
+function createMcpServer({ baseUrl } = {}) {
   const server = new McpServer({
     name: "kokoro-tts-mcp",
     version: "1.0.0",
@@ -132,7 +176,7 @@ function createMcpServer() {
 
   server.tool(
     "generate_tts",
-    "Convert text into spoken audio (MP3 by default) using lightweight local Kokoro TTS and save to the output folder.",
+    "Convert text into spoken audio (MP3 by default) using Kokoro TTS and return a temporary 10-minute download link.",
     {
       text: z.string().min(1).describe("The text to convert to speech"),
       voice: z
@@ -152,21 +196,19 @@ function createMcpServer() {
       outputPath: z
         .string()
         .optional()
-        .describe("Optional filename or path. Defaults to saving inside kokoro-tts-mcp/output/."),
+        .describe("Optional download filename (e.g. greeting.mp3). Defaults to speech-<voice>-<timestamp>.<format>."),
     },
     async ({ text, voice = "af_heart", speed = 1.0, format = "mp3", outputPath }) => {
-      const { audioBuffer, finalFormat, mimeType, savedPath } = await synthesizeAudio({
+      const { audioBuffer, finalFormat, mimeType, filename, downloadUrl } = await synthesizeAudio({
         text,
         voice,
         speed,
         format,
         outputPath,
+        baseUrl,
       });
 
-      const statusText = savedPath
-        ? `Generated ${finalFormat.toUpperCase()} speech with voice "${voice}" and saved to ${savedPath}.`
-        : `Generated ${finalFormat.toUpperCase()} speech with voice "${voice}".`;
-
+      const ttlMinutes = Math.max(1, Math.round(AUDIO_TTL_MS / 60000));
       return {
         content: [
           {
@@ -176,7 +218,10 @@ function createMcpServer() {
           },
           {
             type: "text",
-            text: statusText,
+            text: [
+              `Generated ${finalFormat.toUpperCase()} speech with voice "${voice}" (${filename}).`,
+              `Download link (expires in ${ttlMinutes} minutes): ${downloadUrl}`,
+            ].join("\n"),
           },
         ],
       };
@@ -210,7 +255,7 @@ app.get("/health", (c) => c.json({ ok: true, model: MODEL_ID, ready: ttsReady })
 const corsMiddleware = cors({
   origin: "*",
   allowMethods: ["GET", "POST", "DELETE", "OPTIONS"],
-  exposeHeaders: ["mcp-session-id", "X-Output-Path"],
+  exposeHeaders: ["mcp-session-id", "X-Download-Url", "X-Download-Id", "Content-Disposition"],
 });
 
 // Optional API key / Bearer token auth middleware for /mcp and /tts
@@ -235,6 +280,32 @@ const authMiddleware = async (c, next) => {
 
 app.use("/mcp", corsMiddleware, authMiddleware);
 app.use("/tts", corsMiddleware, authMiddleware);
+app.use("/download/*", corsMiddleware);
+
+// Unauthenticated temporary download endpoint (unguessable UUID, auto-expires after 10 minutes)
+app.get("/download/:id", (c) => {
+  const rawId = c.req.param("id");
+  const id = rawId.replace(/\.(mp3|wav)$/i, "");
+  const clip = audioStore.get(id);
+
+  if (!clip || Date.now() > clip.expiresAt) {
+    if (clip) {
+      if (clip.timeout) clearTimeout(clip.timeout);
+      audioStore.delete(id);
+    }
+    return c.json({ error: "Audio clip not found or expired" }, 404);
+  }
+
+  const disposition = c.req.query("inline") === "1" ? "inline" : "attachment";
+  return new Response(clip.buffer, {
+    headers: {
+      "Content-Type": clip.mimeType,
+      "Content-Length": String(clip.buffer.length),
+      "Content-Disposition": `${disposition}; filename="${clip.filename}"`,
+      "Cache-Control": "private, no-store",
+    },
+  });
+});
 
 // Direct HTTP endpoint for quick app usage alongside MCP
 app.post("/tts", async (c) => {
@@ -260,23 +331,23 @@ app.post("/tts", async (c) => {
     return c.json({ error: "'format' must be 'mp3' or 'wav'" }, 400);
   }
 
-  const { audioBuffer, mimeType, savedPath, finalPath } = await synthesizeAudio({
+  const { audioBuffer, mimeType, filename, id, downloadUrl } = await synthesizeAudio({
     text,
     voice,
     speed,
     format,
     outputPath,
+    baseUrl: getBaseUrl(c),
   });
 
-  const headers = {
-    "Content-Type": mimeType,
-    "Content-Disposition": `inline; filename="${path.basename(finalPath)}"`,
-  };
-  if (savedPath) {
-    headers["X-Output-Path"] = savedPath;
-  }
-
-  return new Response(audioBuffer, { headers });
+  return new Response(audioBuffer, {
+    headers: {
+      "Content-Type": mimeType,
+      "Content-Disposition": `inline; filename="${filename}"`,
+      "X-Download-Url": downloadUrl,
+      "X-Download-Id": id,
+    },
+  });
 });
 
 // Streamable HTTP MCP endpoint (stateless Web Standard transport)
@@ -293,7 +364,7 @@ app.all("/mcp", async (c) => {
     );
   }
 
-  const server = createMcpServer();
+  const server = createMcpServer({ baseUrl: getBaseUrl(c) });
   const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
   });
