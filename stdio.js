@@ -7,16 +7,40 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { KokoroTTS } from "kokoro-js";
 import { z } from "zod";
 
+// Keep stdout strictly reserved for JSON-RPC messages over stdio transport
+console.log = console.error;
+console.info = console.error;
+console.debug = console.error;
+console.warn = console.error;
+
 const MODEL_ID = "onnx-community/Kokoro-82M-v1.0-ONNX";
+const DTYPE = process.env.KOKORO_DTYPE || "q8";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const OUTPUT_DIR = path.join(__dirname, "output");
+const OUTPUT_DIR = process.env.OUTPUT_DIR || path.join(__dirname, "output");
+
+if (process.env.HF_CACHE_DIR) {
+  try {
+    const { env: hfEnv } = await import("@huggingface/transformers");
+    hfEnv.cacheDir = process.env.HF_CACHE_DIR;
+  } catch (err) {
+    console.error("Could not configure transformers cacheDir:", err);
+  }
+}
+
+const STATIC_VOICES =
+  Object.getOwnPropertyDescriptor(KokoroTTS.prototype, "voices")?.get?.() ?? null;
 
 let ttsPromise = null;
 function getTTS() {
   if (!ttsPromise) {
+    console.error(`Loading Kokoro TTS model (${MODEL_ID}, dtype=${DTYPE})...`);
     ttsPromise = KokoroTTS.from_pretrained(MODEL_ID, {
-      dtype: "q8",
+      dtype: DTYPE,
       device: "cpu",
+    }).catch((err) => {
+      console.error("Failed to load Kokoro TTS model:", err);
+      ttsPromise = null;
+      throw err;
     });
   }
   return ttsPromise;
@@ -82,7 +106,7 @@ server.tool(
     outputPath: z
       .string()
       .optional()
-      .describe("Optional filename or path. Defaults to saving inside thekokoro-tts-mcp/output/ folder."),
+      .describe("Optional filename or path. Defaults to saving inside kokoro-tts-mcp/output/."),
   },
   async ({ text, voice = "af_heart", speed = 1.0, format = "mp3", outputPath }) => {
     const tts = await getTTS();
@@ -111,9 +135,9 @@ server.tool(
   "List all available Kokoro TTS voices.",
   {},
   async () => {
-    const tts = await getTTS();
+    const voices = STATIC_VOICES ?? (await getTTS()).voices;
     return {
-      content: [{ type: "text", text: JSON.stringify(tts.voices, null, 2) }],
+      content: [{ type: "text", text: JSON.stringify(voices, null, 2) }],
     };
   }
 );

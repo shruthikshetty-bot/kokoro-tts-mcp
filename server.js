@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { Mp3Encoder } from "@breezystack/lamejs";
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
+import { cors } from "hono/cors";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { KokoroTTS } from "kokoro-js";
@@ -206,10 +207,16 @@ const app = new Hono();
 
 app.get("/health", (c) => c.json({ ok: true, model: MODEL_ID, ready: ttsReady }));
 
+const corsMiddleware = cors({
+  origin: "*",
+  allowMethods: ["GET", "POST", "DELETE", "OPTIONS"],
+  exposeHeaders: ["mcp-session-id", "X-Output-Path"],
+});
+
 // Optional API key / Bearer token auth middleware for /mcp and /tts
 const authMiddleware = async (c, next) => {
   const secret = process.env.MCP_API_KEY || process.env.API_KEY;
-  if (!secret) {
+  if (!secret || c.req.method === "OPTIONS") {
     return next();
   }
 
@@ -226,13 +233,32 @@ const authMiddleware = async (c, next) => {
   return next();
 };
 
-app.use("/mcp", authMiddleware);
-app.use("/tts", authMiddleware);
+app.use("/mcp", corsMiddleware, authMiddleware);
+app.use("/tts", corsMiddleware, authMiddleware);
 
 // Direct HTTP endpoint for quick app usage alongside MCP
 app.post("/tts", async (c) => {
-  const { text, voice = "af_heart", speed = 1.0, format = "mp3", outputPath } = await c.req.json();
-  if (!text) return c.json({ error: "Missing 'text' field" }, 400);
+  let payload;
+  try {
+    payload = await c.req.json();
+  } catch {
+    return c.json({ error: "Invalid JSON body" }, 400);
+  }
+
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return c.json({ error: "Request body must be a JSON object" }, 400);
+  }
+
+  const { text, voice = "af_heart", speed = 1.0, format = "mp3", outputPath } = payload;
+  if (typeof text !== "string" || !text.trim()) {
+    return c.json({ error: "Missing or invalid 'text' field" }, 400);
+  }
+  if (typeof speed !== "number" || Number.isNaN(speed) || speed < 0.5 || speed > 2.0) {
+    return c.json({ error: "'speed' must be a number between 0.5 and 2.0" }, 400);
+  }
+  if (format !== "mp3" && format !== "wav") {
+    return c.json({ error: "'format' must be 'mp3' or 'wav'" }, 400);
+  }
 
   const { audioBuffer, mimeType, savedPath, finalPath } = await synthesizeAudio({
     text,
@@ -271,8 +297,23 @@ app.all("/mcp", async (c) => {
   const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
   });
+
+  let cleanedUp = false;
+  const cleanup = () => {
+    if (cleanedUp) return;
+    cleanedUp = true;
+    transport.close().catch(() => {});
+    server.close().catch(() => {});
+  };
+  c.env?.outgoing?.once?.("close", cleanup);
+
   await server.connect(transport);
-  return transport.handleRequest(c.req.raw);
+  try {
+    return await transport.handleRequest(c.req.raw);
+  } catch (err) {
+    cleanup();
+    throw err;
+  }
 });
 
 const port = Number(process.env.PORT ?? 8080);
