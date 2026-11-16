@@ -1,0 +1,21 @@
+{
+  "name": "kokoro-tts-mcp",
+  "version": "1.0.0",
+  "description": "Lightweight Hono + Kokoro TTS MCP server",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "stdio": "node stdio.js"
+  },
+  "dependencies": {
+    "@breezystack/lamejs": "^1.2.7",
+    "@hono/node-server": "^1.14.0",
+    "@modelcontextprotocol/sdk": "^1.8.0",
+    "hono": "^4.7.5",
+    "kokoro-js": "^1.2.0",
+    "zod": "^3.25.0"
+  }
+}
