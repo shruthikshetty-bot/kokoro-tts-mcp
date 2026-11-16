@@ -1,26 +1,54 @@
 import { mkdir, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Mp3Encoder } from "@breezystack/lamejs";
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { KokoroTTS } from "kokoro-js";
 import { z } from "zod";
 
 const MODEL_ID = "onnx-community/Kokoro-82M-v1.0-ONNX";
+const DTYPE = process.env.KOKORO_DTYPE || "q8";
+const IS_CLOUD_RUN = Boolean(process.env.K_SERVICE);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const OUTPUT_DIR = path.join(__dirname, "output");
+const OUTPUT_DIR =
+  process.env.OUTPUT_DIR ||
+  (IS_CLOUD_RUN ? path.join(os.tmpdir(), "kokoro-tts-output") : path.join(__dirname, "output"));
+
+if (process.env.HF_CACHE_DIR || IS_CLOUD_RUN) {
+  try {
+    const { env: hfEnv } = await import("@huggingface/transformers");
+    hfEnv.cacheDir = process.env.HF_CACHE_DIR || path.join(os.tmpdir(), "kokoro-hf-cache");
+  } catch (err) {
+    console.warn("Could not configure transformers cacheDir:", err);
+  }
+}
+
+const STATIC_VOICES =
+  Object.getOwnPropertyDescriptor(KokoroTTS.prototype, "voices")?.get?.() ?? null;
 
 let ttsPromise = null;
+let ttsReady = false;
 function getTTS() {
   if (!ttsPromise) {
-    console.error("Loading Kokoro TTS model (first run downloads ~86MB)...");
+    console.error(`Loading Kokoro TTS model (${MODEL_ID}, dtype=${DTYPE})...`);
     ttsPromise = KokoroTTS.from_pretrained(MODEL_ID, {
-      dtype: "q8",
+      dtype: DTYPE,
       device: "cpu",
-    });
+    })
+      .then((tts) => {
+        ttsReady = true;
+        console.error("Kokoro TTS model loaded and ready.");
+        return tts;
+      })
+      .catch((err) => {
+        ttsPromise = null;
+        ttsReady = false;
+        throw err;
+      });
   }
   return ttsPromise;
 }
@@ -69,6 +97,32 @@ function resolveOutputPath(outputPath, voice, format) {
   return target;
 }
 
+async function synthesizeAudio({ text, voice = "af_heart", speed = 1.0, format = "mp3", outputPath }) {
+  const tts = await getTTS();
+  const audio = await tts.generate(text, { voice, speed });
+
+  const isWav =
+    format === "wav" || (outputPath && outputPath.toLowerCase().endsWith(".wav") && format !== "mp3");
+  const finalFormat = isWav ? "wav" : "mp3";
+  const mimeType = finalFormat === "wav" ? "audio/wav" : "audio/mpeg";
+  const audioBuffer = finalFormat === "wav" ? Buffer.from(audio.toWav()) : encodeMp3(audio);
+
+  const finalPath = resolveOutputPath(outputPath, voice, finalFormat);
+  let savedPath = null;
+  try {
+    await mkdir(path.dirname(finalPath), { recursive: true });
+    await writeFile(finalPath, audioBuffer);
+    savedPath = finalPath;
+  } catch (err) {
+    if (outputPath) {
+      throw err;
+    }
+    console.warn("Skipping disk write for generated audio:", err.message);
+  }
+
+  return { audioBuffer, finalFormat, mimeType, savedPath, finalPath };
+}
+
 function createMcpServer() {
   const server = new McpServer({
     name: "kokoro-tts-mcp",
@@ -100,17 +154,17 @@ function createMcpServer() {
         .describe("Optional filename or path. Defaults to saving inside kokoro-tts-mcp/output/."),
     },
     async ({ text, voice = "af_heart", speed = 1.0, format = "mp3", outputPath }) => {
-      const tts = await getTTS();
-      const audio = await tts.generate(text, { voice, speed });
+      const { audioBuffer, finalFormat, mimeType, savedPath } = await synthesizeAudio({
+        text,
+        voice,
+        speed,
+        format,
+        outputPath,
+      });
 
-      const isWav = format === "wav" || (outputPath && outputPath.toLowerCase().endsWith(".wav") && format !== "mp3");
-      const finalFormat = isWav ? "wav" : "mp3";
-      const mimeType = finalFormat === "wav" ? "audio/wav" : "audio/mpeg";
-      const audioBuffer = finalFormat === "wav" ? Buffer.from(audio.toWav()) : encodeMp3(audio);
-
-      const finalPath = resolveOutputPath(outputPath, voice, finalFormat);
-      await mkdir(path.dirname(finalPath), { recursive: true });
-      await writeFile(finalPath, audioBuffer);
+      const statusText = savedPath
+        ? `Generated ${finalFormat.toUpperCase()} speech with voice "${voice}" and saved to ${savedPath}.`
+        : `Generated ${finalFormat.toUpperCase()} speech with voice "${voice}".`;
 
       return {
         content: [
@@ -121,7 +175,7 @@ function createMcpServer() {
           },
           {
             type: "text",
-            text: `Generated ${finalFormat.toUpperCase()} speech with voice "${voice}" and saved to ${finalPath}.`,
+            text: statusText,
           },
         ],
       };
@@ -133,12 +187,12 @@ function createMcpServer() {
     "List all available Kokoro TTS voice IDs and details.",
     {},
     async () => {
-      const tts = await getTTS();
+      const voices = STATIC_VOICES ?? (await getTTS()).voices;
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify(tts.voices, null, 2),
+            text: JSON.stringify(voices, null, 2),
           },
         ],
       };
@@ -150,7 +204,7 @@ function createMcpServer() {
 
 const app = new Hono();
 
-app.get("/health", (c) => c.json({ ok: true, model: MODEL_ID }));
+app.get("/health", (c) => c.json({ ok: true, model: MODEL_ID, ready: ttsReady }));
 
 // Optional API key / Bearer token auth middleware for /mcp and /tts
 const authMiddleware = async (c, next) => {
@@ -179,44 +233,55 @@ app.use("/tts", authMiddleware);
 app.post("/tts", async (c) => {
   const { text, voice = "af_heart", speed = 1.0, format = "mp3", outputPath } = await c.req.json();
   if (!text) return c.json({ error: "Missing 'text' field" }, 400);
-  const tts = await getTTS();
-  const audio = await tts.generate(text, { voice, speed });
 
-  const finalFormat = format === "wav" ? "wav" : "mp3";
-  const mimeType = finalFormat === "wav" ? "audio/wav" : "audio/mpeg";
-  const audioBuffer = finalFormat === "wav" ? Buffer.from(audio.toWav()) : encodeMp3(audio);
-
-  const finalPath = resolveOutputPath(outputPath, voice, finalFormat);
-  await mkdir(path.dirname(finalPath), { recursive: true });
-  await writeFile(finalPath, audioBuffer);
-
-  return new Response(audioBuffer, {
-    headers: {
-      "Content-Type": mimeType,
-      "Content-Disposition": `inline; filename="${path.basename(finalPath)}"`,
-      "X-Output-Path": finalPath,
-    },
+  const { audioBuffer, mimeType, savedPath, finalPath } = await synthesizeAudio({
+    text,
+    voice,
+    speed,
+    format,
+    outputPath,
   });
+
+  const headers = {
+    "Content-Type": mimeType,
+    "Content-Disposition": `inline; filename="${path.basename(finalPath)}"`,
+  };
+  if (savedPath) {
+    headers["X-Output-Path"] = savedPath;
+  }
+
+  return new Response(audioBuffer, { headers });
 });
 
-// Streamable HTTP MCP endpoint
+// Streamable HTTP MCP endpoint (stateless Web Standard transport)
 app.all("/mcp", async (c) => {
+  if (c.req.method === "GET") {
+    return c.json(
+      {
+        jsonrpc: "2.0",
+        error: { code: -32000, message: "Method not allowed." },
+        id: null,
+      },
+      405,
+      { Allow: "POST, DELETE" }
+    );
+  }
+
   const server = createMcpServer();
-  const transport = new StreamableHTTPServerTransport({
+  const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
   });
   await server.connect(transport);
-
-  const req = c.env.incoming;
-  const res = c.env.outgoing;
-  const body = c.req.method === "POST" ? await c.req.json() : undefined;
-  await transport.handleRequest(req, res, body);
-  return new Response(null);
+  return transport.handleRequest(c.req.raw);
 });
 
 const port = Number(process.env.PORT ?? 8080);
 const hostname = process.env.HOST ?? "0.0.0.0";
 
-serve({ fetch: app.fetch, port, hostname }, () => {
+// Keep native global Response/Request intact so @huggingface/transformers FileCache works on fresh containers
+serve({ fetch: app.fetch, port, hostname, overrideGlobalObjects: false }, () => {
   console.log(`Kokoro TTS MCP server running at http://${hostname}:${port}/mcp`);
+  getTTS().catch((err) => {
+    console.error("Background Kokoro TTS warmup failed:", err);
+  });
 });
