@@ -152,6 +152,29 @@ const app = new Hono();
 
 app.get("/health", (c) => c.json({ ok: true, model: MODEL_ID }));
 
+// Optional API key / Bearer token auth middleware for /mcp and /tts
+const authMiddleware = async (c, next) => {
+  const secret = process.env.MCP_API_KEY || process.env.API_KEY;
+  if (!secret) {
+    return next();
+  }
+
+  const authHeader = c.req.header("Authorization") || "";
+  const bearerToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : null;
+  const headerKey = c.req.header("x-api-key") || c.req.header("X-API-Key");
+  const queryKey = c.req.query("api_key") || c.req.query("key");
+
+  const provided = bearerToken || headerKey || queryKey;
+  if (provided !== secret) {
+    return c.json({ error: "Unauthorized: Invalid or missing API secret" }, 401);
+  }
+
+  return next();
+};
+
+app.use("/mcp", authMiddleware);
+app.use("/tts", authMiddleware);
+
 // Direct HTTP endpoint for quick app usage alongside MCP
 app.post("/tts", async (c) => {
   const { text, voice = "af_heart", speed = 1.0, format = "mp3", outputPath } = await c.req.json();
